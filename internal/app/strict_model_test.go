@@ -1,8 +1,10 @@
 package app
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // strict_model（#41）的判定不变量：只有"服务端自报的模型确实不是请求的那个"才算降级；
@@ -85,5 +87,63 @@ func TestStrictModelViolation(t *testing.T) {
 	// 上游失败时 res 就是 nil，不能 panic
 	if got := strictModelViolation("gemini-4-argon", nil); got != "" {
 		t.Errorf("res 为 nil 时应放行，实际 %q", got)
+	}
+}
+
+// 提前中断（读帧时判定）的两条不变量。真实场景里这两条直接决定 429 是 5 秒还是
+// 45 秒才回来：命中降级必须**立刻停**，而只是"模型正常"时必须继续读完。
+func TestReadBodyAbortsOnModelHook(t *testing.T) {
+	// 帧 [42] 自报模型名的形态：\"<16位hex>\",null,null,\"<显示名>\"
+	body := ")]}'\n" +
+		`[["wrb.fr",null,"[[...\"fbb127bbb056c959\",null,null,\"3.5 Flash-Lite\",true...]]"]]` + "\n" +
+		"第三行：命中之后不该再被读到\n"
+
+	var seen []string
+	onLine := func(line string) { seen = append(seen, line) }
+	var hooked []string
+	hook := func(name string) error {
+		hooked = append(hooked, name)
+		return &StrictModelError{Requested: "gemini-4-argon", Actual: name, Expected: "4 argon"}
+	}
+
+	_, _, err := readBody(strings.NewReader(body), onLine, hook, time.Now())
+
+	var sme *StrictModelError
+	if !errors.As(err, &sme) {
+		t.Fatalf("命中降级时应把 StrictModelError 交上来，实际 %v", err)
+	}
+	if len(hooked) != 1 || hooked[0] != "3.5 Flash-Lite" {
+		t.Errorf("钩子应恰好被调用一次并拿到上游自报的模型名，实际 %v", hooked)
+	}
+	// 模型名在第二行，所以"读到 2 行"才是对的；关键是第三行必须没被读。
+	for _, line := range seen {
+		if strings.Contains(line, "第三行") {
+			t.Fatalf("命中后不该继续读后面的行，实际读到了：%v", seen)
+		}
+	}
+	if len(seen) != 2 {
+		t.Errorf("应停在模型名所在的行，实际读了 %d 行：%v", len(seen), seen)
+	}
+}
+
+func TestReadBodyKeepsReadingWhenModelMatches(t *testing.T) {
+	body := "第一行\n" +
+		`[["wrb.fr",null,"[[...\"fbb127bbb056c959\",null,null,\"4 Argon\",true...]]"]]` + "\n" +
+		"第三行\n"
+
+	var seen []string
+	onLine := func(line string) { seen = append(seen, line) }
+	// 模型名对得上（钩子放行）→ 必须继续读完，不能因为"看到了模型名"就提前收工。
+	hook := func(name string) error { return strictModelAbort("gemini-4-argon", name) }
+
+	raw, _, err := readBody(strings.NewReader(body), onLine, hook, time.Now())
+	if err != nil {
+		t.Fatalf("模型对得上时不该报错，实际 %v", err)
+	}
+	if len(seen) != 3 {
+		t.Errorf("应读完 3 行，实际 %d 行", len(seen))
+	}
+	if !strings.Contains(string(raw), "第三行") {
+		t.Error("放行时响应体应完整返回")
 	}
 }

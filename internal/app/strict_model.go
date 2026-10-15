@@ -81,18 +81,55 @@ func ModelDowngraded(model, upstream string) (bool, string) {
 	return true, want[0]
 }
 
-// strictModelViolation 在开启 strict_model 时检查本次请求，命中降级则返回要发给
-// 客户端的错误文案（空串 = 放行）。关掉开关时恒为空串，不产生任何开销。
-func strictModelViolation(model string, res *StreamResult) string {
-	if !rtCfg().StrictModel || res == nil {
-		return ""
-	}
-	bad, want := ModelDowngraded(model, res.UpstreamModel)
-	if !bad {
-		return ""
-	}
+// StrictModelError 是"上游静默降级"这件事本身，做成可识别的错误类型。
+//
+// 为什么需要类型：底层读取（readBody）在**帧里第一次看到模型名**时就能判定，
+// 此时必须立刻中断本次请求 —— 不能把它当成"上游故障"去走重试，否则会把同样的
+// 降级再等一遍（实测每次要多等 45-55 秒）。
+type StrictModelError struct {
+	Requested string // 客户端要的模型
+	Actual    string // 上游自报实际用的
+	Expected  string // 判据（期望出现的显示名片段）
+}
+
+func (e *StrictModelError) Error() string {
 	return fmt.Sprintf(
 		"strict_model：上游把 %s 静默降级成了 %s（期望 %s）。通常是该账号额度已耗尽，"+
 			"换一个还有额度的账号，或关掉 strict_model。",
-		model, res.UpstreamModel, want)
+		e.Requested, e.Actual, e.Expected)
+}
+
+// strictModelAbort 在读到上游自报的模型名时做**提前**判定。
+// 返回非 nil 表示要立刻中断本次请求：实测把"发现降级"从整段生成完（45-55 秒）
+// 提前到首帧到达（3-4 秒），顺带省下那段白生成的用量。
+func strictModelAbort(model, upstream string) error {
+	if !rtCfg().StrictModel {
+		return nil
+	}
+	bad, want := ModelDowngraded(model, upstream)
+	if !bad {
+		return nil
+	}
+	return &StrictModelError{Requested: model, Actual: upstream, Expected: want}
+}
+
+// strictModelHook 给底层读取用的钩子；开关关闭时返回 nil（零开销，逐行扫描里
+// 连一次正则都不会跑）。
+func strictModelHook(model string) func(string) error {
+	if !rtCfg().StrictModel {
+		return nil
+	}
+	return func(upstream string) error { return strictModelAbort(model, upstream) }
+}
+
+// strictModelViolation 在响应读完之后再兜一次底（空串 = 放行）。
+// 提前判定没命中时（模型名出现在很晚的帧里 / 被行边界切开）由它负责。
+func strictModelViolation(model string, res *StreamResult) string {
+	if res == nil {
+		return ""
+	}
+	if err := strictModelAbort(model, res.UpstreamModel); err != nil {
+		return err.Error()
+	}
+	return ""
 }
