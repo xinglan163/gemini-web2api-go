@@ -239,7 +239,7 @@ a specific URL's content — is not implemented yet).
 from the Gemini web app:
 
 ```json
-{"ok":true,"account":"Ultra(imported)","account_id":1,
+{"ok":true,"account":"my-account","account_id":1,
  "five_hour":{"used_percent":63,"remain_percent":37,"reset_at":1792050755,"reset_in_sec":13504},
  "weekly":{"used_percent":13,"remain_percent":87,"reset_at":1792486355,"reset_in_sec":503104}}
 ```

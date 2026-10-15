@@ -254,7 +254,7 @@ func getQuota(force bool, accountID int64) QuotaSnapshot {
 
 // handleAdminQuota — GET /admin/api/quota[?account_id=N][?refresh=1]
 //
-//	{"ok":true,"account":"Ultra(FF导入)","account_id":2,"five_hour":{"used_percent":63,...},"weekly":{...}}
+//	{"ok":true,"account":"my-account","account_id":2,"five_hour":{"used_percent":63,...},"weekly":{...}}
 //
 // account_id 用于按账号查询：多号池逐号看「这个号还剩多少额度」时用得到
 // （被停用/冷却中的号也能查）。不传时按自动选号。

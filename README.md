@@ -232,7 +232,7 @@ Claude Code / Cursor 这类 MCP 客户端能「用 Gemini 去搜网」，返回*
 `GET /admin/api/quota`（需 admin token）——读 Gemini 网页端 **5 小时滚动窗口 / 每周**两档用量额度：
 
 ```json
-{"ok":true,"account":"Ultra(FF导入)","account_id":1,
+{"ok":true,"account":"my-account","account_id":1,
  "five_hour":{"used_percent":63,"remain_percent":37,"reset_at":1792050755,"reset_in_sec":13504},
  "weekly":{"used_percent":13,"remain_percent":87,"reset_at":1792486355,"reset_in_sec":503104}}
 ```
