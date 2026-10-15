@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,15 +55,35 @@ type QuotaSnapshot struct {
 	Error     string       `json:"error,omitempty"`
 }
 
+// quotaCacheEntry 是一次成功的额度快照，按账号缓存。
+type quotaCacheEntry struct {
+	snap QuotaSnapshot
+	at   time.Time
+}
+
 var (
-	quotaMu     sync.Mutex
-	quotaCache  *QuotaSnapshot
-	quotaCacheT time.Time
+	// quotaMu 只保护下面两张表本身，**不覆盖网络请求**——
+	// 面板会并发问好几个账号的额度，若整段持锁，N 个账号就要串行 N 次上游 RTT。
+	quotaMu    sync.Mutex
+	quotaCache = map[int64]quotaCacheEntry{}
+	quotaLocks = map[int64]*sync.Mutex{}
 )
 
 // quotaCacheTTL 让插件即便每分钟轮询也不会把上游打爆。网页端自己显示「Updated just now」，
 // 但额度是慢变量，20 秒足够新。
 const quotaCacheTTL = 20 * time.Second
+
+// quotaLock 取某个账号（0 = 自动选号）的单飞锁：同一账号并发请求只打一次上游。
+func quotaLock(id int64) *sync.Mutex {
+	quotaMu.Lock()
+	defer quotaMu.Unlock()
+	l, ok := quotaLocks[id]
+	if !ok {
+		l = new(sync.Mutex)
+		quotaLocks[id] = l
+	}
+	return l
+}
 
 // quotaAccount 选出最该用的账号，**不改写 last_used_at**（额度查询不该推进轮转）。
 func quotaAccount() (*CookieAccount, bool) {
@@ -88,6 +109,17 @@ func quotaAccount() (*CookieAccount, bool) {
 	return &cands[0], true
 }
 
+// quotaAccountByID 按 id 取账号，**不限启用状态**：
+// 面板要看的恰恰是「被停用/正在冷却的那个号还剩多少额度」，所以这里不按 status 过滤。
+// 但必须有 cookie —— 没有登录态就没有账号级额度可查。
+func quotaAccountByID(id int64) (*CookieAccount, bool) {
+	a := accountByID(id)
+	if a == nil || strings.TrimSpace(a.Cookie) == "" {
+		return nil, false
+	}
+	return a, true
+}
+
 // quotaProxy 挑出口：优先账号绑定的那个，否则代理池里第一个健康的，池空则直连。
 // 与 handleAdminTest 同款（旁路查询，不占限流 slot）。
 func quotaProxy(preferID int64) (proxyURL, proxyName string, direct bool) {
@@ -111,13 +143,28 @@ func quotaProxy(preferID int64) (proxyURL, proxyName string, direct bool) {
 }
 
 // fetchQuotaRPC 真打一次上游拿额度。
-func fetchQuotaRPC() QuotaSnapshot {
+//
+// preferID != 0 时查指定账号（管理面板多号池逐号查额度时用），否则沿用自动选号。
+func fetchQuotaRPC(preferID int64) QuotaSnapshot {
 	snap := QuotaSnapshot{FetchedAt: time.Now().Unix()}
 
-	acct, ok := quotaAccount()
-	if !ok {
-		snap.Error = "cookie 池里没有启用的账号：额度是账号级的，先挂 Google cookie（面板 Cookie 池）"
-		return snap
+	var acct *CookieAccount
+	var ok bool
+	if preferID != 0 {
+		acct, ok = quotaAccountByID(preferID)
+		if !ok {
+			// 失败也回填 AccountID：调用方靠它确认这份结果是不是自己问的那个号，
+			// 拿不到匹配值时就不该把数字挂到这个账号名下。
+			snap.AccountID = preferID
+			snap.Error = fmt.Sprintf("账号 #%d 不存在或没有 cookie", preferID)
+			return snap
+		}
+	} else {
+		acct, ok = quotaAccount()
+		if !ok {
+			snap.Error = "cookie 池里没有启用的账号：额度是账号级的，先挂 Google cookie（面板 Cookie 池）"
+			return snap
+		}
 	}
 	snap.AccountID, snap.Account = acct.ID, acct.Label
 	proxyURL, proxyName, direct := quotaProxy(acct.ProxyID)
@@ -180,34 +227,63 @@ func fetchQuotaRPC() QuotaSnapshot {
 	return snap
 }
 
-// getQuota 带缓存地取额度。
-func getQuota(force bool) QuotaSnapshot {
+// getQuota 带缓存地取额度。accountID = 0 表示自动选号。
+func getQuota(force bool, accountID int64) QuotaSnapshot {
+	lock := quotaLock(accountID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	quotaMu.Lock()
-	defer quotaMu.Unlock()
-	if !force && quotaCache != nil && time.Since(quotaCacheT) < quotaCacheTTL {
-		c := *quotaCache
+	entry, cached := quotaCache[accountID]
+	quotaMu.Unlock()
+	if cached && !force && time.Since(entry.at) < quotaCacheTTL {
+		c := entry.snap
 		c.Cached = true
 		return c
 	}
-	snap := fetchQuotaRPC()
-	if snap.OK { // 失败不写缓存，下次立刻重试
-		quotaCache = &snap
-		quotaCacheT = time.Now()
+
+	snap := fetchQuotaRPC(accountID)
+	if !snap.OK { // 失败不写缓存，下次立刻重试
+		return snap
 	}
+	quotaMu.Lock()
+	quotaCache[accountID] = quotaCacheEntry{snap: snap, at: time.Now()}
+	quotaMu.Unlock()
 	return snap
 }
 
-// handleAdminQuota — GET /admin/api/quota[?refresh=1]
+// handleAdminQuota — GET /admin/api/quota[?account_id=N][?refresh=1]
 //
-//	{"ok":true,"account":"Ultra(FF导入)","five_hour":{"used_percent":63,...},"weekly":{...}}
+//	{"ok":true,"account":"Ultra(FF导入)","account_id":2,"five_hour":{"used_percent":63,...},"weekly":{...}}
+//
+// account_id 用于按账号查询：多号池逐号看「这个号还剩多少额度」时用得到
+// （被停用/冷却中的号也能查）。不传时按自动选号。
 func handleAdminQuota(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		force := r.URL.Query().Get("refresh") == "1"
-		writeJSON(w, 200, getQuota(force))
+		q := r.URL.Query()
+		accountID, err := parseAccountID(q.Get("account_id"))
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad account_id"})
+			return
+		}
+		writeJSON(w, 200, getQuota(q.Get("refresh") == "1", accountID))
 	default:
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 	}
+}
+
+// parseAccountID 解析 ?account_id=N：空串表示自动选号（返回 0），非法值返回错误。
+func parseAccountID(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("bad account_id: %q", raw)
+	}
+	return id, nil
 }
 
 // parseQuotaBody 从 batchexecute 原始响应里抽出 5 小时 / 每周两档额度。
