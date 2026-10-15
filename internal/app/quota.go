@@ -106,6 +106,13 @@ func quotaAccount() (*CookieAccount, bool) {
 		}
 		return cands[i].ID < cands[j].ID
 	})
+	// 关键：这里必须跟上**请求挑号**用的是同一套排序，否则额度接口报的"当前账号"
+	// 会跟真正发请求的号不一致 —— 开了 quota_aware_pick 之后请求会按额度带改道，
+	// 而这里若只看 fail_count/last_used_at，UI 就会一直显示另一个号（实测踩到）。
+	if rtCfg().QuotaAwarePick {
+		prepareQuotaWarmth(cands)
+		cands = orderAccountsByQuota(cands, true)
+	}
 	return &cands[0], true
 }
 
