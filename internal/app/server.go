@@ -351,6 +351,25 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		finish = "tool_calls"
 	}
 
+	// strict_model（#41）：上游额度耗尽时会静默换成更弱的模型却照回 200。开了这个
+	// 开关就不装看不见——宁可报错，也不把降级后的正文当成"你要的模型答的"发出去。
+	if violation := strictModelViolation(modelName, res); violation != "" {
+		recordRequest("chat.completions", modelName, prompt, "", res, 429, violation, stream)
+		if sse != nil && sse.Started() {
+			// 已经开流：HTTP 状态码改不了了，只能用错误帧中断，让客户端看到失败
+			// 而不是一段降级后的正文。之所以只能"事后"发现——模型名是上游在帧 [42]
+			// 自报的，等能判断时正文可能已经转发出去了。
+			sse.Fail(fmt.Errorf("%s", violation))
+			return
+		}
+		writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
+			"message": violation,
+			"type":    "insufficient_quota",
+			"code":    "model_downgraded",
+		}})
+		return
+	}
+
 	recordRequest("chat.completions", modelName, prompt, text, res, 200, "", stream)
 	if stream {
 		var usage map[string]int
@@ -721,6 +740,35 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"annotations": []interface{}{},
 			}},
 		})
+	}
+
+	// strict_model（#41）：与 chat 路径同一条判定，理由见那边的注释。
+	if violation := strictModelViolation(modelName, res); violation != "" {
+		recordRequest("responses", modelName, prompt, "", res, 429, violation, stream)
+		if stream {
+			// 这条路用 response.failed 事件表达失败，形状与上面的 502 分支一致。
+			writeEvent("response.failed", map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id":     rid,
+					"object": "response",
+					"status": "failed",
+					"model":  modelName,
+					"error": map[string]string{
+						"message": violation,
+						"type":    "insufficient_quota",
+						"code":    "model_downgraded",
+					},
+				},
+			})
+			return
+		}
+		writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
+			"message": violation,
+			"type":    "insufficient_quota",
+			"code":    "model_downgraded",
+		}})
+		return
 	}
 
 	recordRequest("responses", modelName, prompt, text, res, 200, "", stream)
